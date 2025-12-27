@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "gemini-image": {
+      "command": "node",
+      "args": ["<ABSOLUTE_PATH_TO>/geminiimagemcp/src/index.js"],
+      "env": {
+        "OPENAI_BASE_URL": "http://127.0.0.1:8317",
+        "OPENAI_API_KEY": "",
+        "OPENAI_MODEL": "gemini-3-pro-image-preview",
+        "OPENAI_IMAGE_MODE": "chat",
+        "OPENAI_TIMEOUT_MS": "120000"
+      }
+    }
+  }
+}

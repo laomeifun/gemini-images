@@ -1,0 +1,22 @@
+{
+  "name": "gemini-image-mcp",
+  "version": "0.1.0",
+  "description": "MCP server: generate images via an OpenAI-compatible Gemini endpoint",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "gemini-image-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "debug:mcp": "node scripts/debug-mcp.js",
+    "debug:upstream": "node scripts/debug-upstream.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "dotenv": "^17.2.3"
+  }
+}
