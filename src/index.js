@@ -115,10 +115,6 @@ function isDebugEnabled() {
   return process.env.OPENAI_DEBUG === "1" || process.env.DEBUG === "1";
 }
 
-function debugLog(...args) {
-  if (isDebugEnabled()) console.error(...args);
-}
-
 function parseDataUrl(maybeDataUrl) {
   const s = String(maybeDataUrl ?? "");
   const match = /^data:([^;]+);base64,(.+)$/s.exec(s);
