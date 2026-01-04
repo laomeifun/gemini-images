@@ -90,7 +90,9 @@ function extFromMime(mimeType) {
 
 function resolveOutDir(rawOutDir) {
   let outDir = String(rawOutDir ?? "").trim();
-  if (!outDir) return path.join(PROJECT_ROOT, "debug-output");
+  
+  // 不再提供默认路径，返回空让调用方处理
+  if (!outDir) return "";
   
   // 处理 ~ 路径 (Home 目录)
   if (outDir.startsWith("~")) {
@@ -410,7 +412,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           outDir: {
             type: "string",
-            description: "保存目录。默认为项目下的 debug-output 文件夹。可指定绝对路径或相对路径",
+            description: "保存目录（必填）。指定图片保存的目录路径，支持绝对路径、相对路径或 ~ 开头的用户目录路径",
           },
         },
       },
@@ -459,6 +461,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const outDir = resolveOutDir(
     args.outDir ?? args.out_dir ?? args.outdir ?? args.output_dir ?? process.env.OPENAI_IMAGE_OUT_DIR
   );
+  
+  // output=path 模式下，outDir 是必填的
+  if (output === "path" && !outDir) {
+    return { 
+      isError: true, 
+      content: [{ 
+        type: "text", 
+        text: "参数 outDir 不能为空。请指定图片保存目录，例如：outDir: '~/Pictures' 或 outDir: 'C:/Users/xxx/Pictures'" 
+      }] 
+    };
+  }
 
   const baseUrl = process.env.OPENAI_BASE_URL ?? "http://127.0.0.1:8317";
   const apiKey = process.env.OPENAI_API_KEY ?? process.env.GEMINI_API_KEY ?? "";
