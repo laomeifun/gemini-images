@@ -542,17 +542,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       },
     ];
     
-    // 无论 output 是什么，都附带图片数据，让客户端可以直接展示
-    // 如果用户明确只要路径（output=path），也附带图片以便展示
-    // 如果用户要 image，则只返回图片不保存（已在上面处理）
+    // 智能判断是否附带图片数据：
+    // - 小图片（< 1MB base64）：附带图片数据，客户端可直接展示
+    // - 大图片（≥ 1MB base64）：只返回路径，避免 token 爆炸
+    // 可通过环境变量 OPENAI_IMAGE_INLINE_MAX_SIZE 调整阈值（单位：字节，默认 1MB）
+    const inlineMaxSize = parseIntOr(process.env.OPENAI_IMAGE_INLINE_MAX_SIZE, 1024 * 1024);
+    
+    let skippedLargeImages = 0;
     for (const img of images) {
       if (img.base64 && typeof img.base64 === "string") {
-        content.push({
-          type: "image",
-          mimeType: img.mimeType || "image/png",
-          data: img.base64,
-        });
+        // base64 字符串长度约等于原始字节数 * 1.37，这里用字符串长度近似判断
+        const estimatedSize = img.base64.length * 0.75; // base64 解码后的实际大小
+        if (estimatedSize <= inlineMaxSize) {
+          content.push({
+            type: "image",
+            mimeType: img.mimeType || "image/png",
+            data: img.base64,
+          });
+        } else {
+          skippedLargeImages++;
+        }
       }
+    }
+    
+    // 如果有大图片被跳过，提示用户
+    if (skippedLargeImages > 0) {
+      content[0].text += `\n\n💡 ${skippedLargeImages} 张图片因体积过大（>${Math.round(inlineMaxSize / 1024)}KB）未内联展示，请通过上述路径查看`;
     }
 
     return { content };
