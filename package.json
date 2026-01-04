@@ -1,6 +1,6 @@
 {
-  "name": "gemini-image-mcp",
-  "version": "0.1.0",
+  "name": "@laomeifun/gemini-image-mcp",
+  "version": "0.0.1",
   "description": "MCP server: generate images via an OpenAI-compatible Gemini endpoint",
   "type": "module",
   "main": "src/index.js",
@@ -12,9 +12,27 @@
     "debug:mcp": "node scripts/debug-mcp.js",
     "debug:upstream": "node scripts/debug-upstream.js"
   },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "gemini",
+    "image-generation",
+    "ai",
+    "openai-compatible"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/laomeifun/geminiimagemcp_public.git"
+  },
   "engines": {
     "node": ">=18"
   },
+  "files": [
+    "src/",
+    "README.md"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
     "dotenv": "^17.2.3"
