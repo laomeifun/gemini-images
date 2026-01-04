@@ -468,7 +468,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true, 
       content: [{ 
         type: "text", 
-        text: "参数 outDir 不能为空。请指定图片保存目录，例如：outDir: '~/Pictures' 或 outDir: 'C:/Users/xxx/Pictures'" 
+        text: "参数 outDir 不能为空。请指定图片保存目录，例如：\n- Windows: outDir: 'C:/Users/xxx/Pictures' 或 '~/Pictures'\n- macOS/Linux: outDir: '~/Pictures' 或 '/home/xxx/Pictures'\n注：~ 会自动解析为用户主目录" 
       }] 
     };
   }
