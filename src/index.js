@@ -1,749 +1,58 @@
 #!/usr/bin/env node
-import dotenv from "dotenv";
-import crypto from "node:crypto";
-import fs from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+/**
+ * gemini-images MCP 服务器
+ * 通过 OpenAI 兼容的 Gemini 端点提供 AI 图像生成和编辑功能
+ */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import os from "node:os";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const PROJECT_ROOT = path.resolve(__dirname, "..");
+import { config } from "./config.js";
+import {
+  setMcpServer,
+  debugLog,
+  clampInt,
+  parseIntOr,
+  resolveOutDir,
+  getDefaultPicturesDir,
+  parseDataUrl,
+  isValidBase64,
+} from "./utils.js";
+import {
+  getOrCreateSession,
+  isNewSession,
+  updateSession,
+  buildUserContent,
+  startSessionCleanup,
+} from "./session.js";
+import { generateImages } from "./api-client.js";
+import {
+  saveImages,
+  formatSaveResultText,
+  buildMcpContent,
+  buildImageOnlyContent,
+  buildErrorResponse,
+} from "./image-handler.js";
 
-// 加载环境变量：优先 .env.local，然后 .env
-dotenv.config({ path: path.join(PROJECT_ROOT, ".env.local") });
-dotenv.config({ path: path.join(PROJECT_ROOT, ".env") });
-
-const DEFAULT_MODEL = "gemini-3-pro-image-preview";
-const DEFAULT_SIZE = "1024x1024";
-const DEFAULT_TIMEOUT_MS = 120_000;
-const DEFAULT_OUTPUT = "path"; // path|image
-const DEFAULT_SESSION_TTL_MS = 30 * 60 * 1000; // 会话默认 30 分钟过期
-
-// ============ 多轮对话会话管理 ============
-/**
- * 会话存储结构
- * @type {Map<string, {
- *   id: string,
- *   messages: Array<{role: string, content: any}>,
- *   lastImage: {base64: string, mimeType: string} | null,
- *   createdAt: number,
- *   lastUsedAt: number
- * }>}
- */
-const sessions = new Map();
-
-/**
- * 生成会话 ID
- */
-function generateSessionId() {
-  return crypto.randomBytes(8).toString("hex");
-}
-
-/**
- * 获取或创建会话
- */
-function getOrCreateSession(sessionId) {
-  if (sessionId && sessions.has(sessionId)) {
-    const session = sessions.get(sessionId);
-    session.lastUsedAt = Date.now();
-    return session;
-  }
-  
-  const newSession = {
-    id: generateSessionId(),
-    messages: [],
-    lastImage: null,
-    createdAt: Date.now(),
-    lastUsedAt: Date.now(),
-  };
-  sessions.set(newSession.id, newSession);
-  return newSession;
-}
-
-/**
- * 清理过期会话
- */
-function cleanupExpiredSessions() {
-  const ttl = parseIntOr(process.env.SESSION_TTL_MS, DEFAULT_SESSION_TTL_MS);
-  const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (now - session.lastUsedAt > ttl) {
-      sessions.delete(id);
-      debugLog(`[session] 清理过期会话: ${id}`);
-    }
-  }
-}
-
-// 每 5 分钟清理一次过期会话
-setInterval(cleanupExpiredSessions, 5 * 60 * 1000);
-
-// ============ 多轮对话会话管理结束 ============
-
+// ============ MCP 服务器初始化 ============
 const server = new Server(
   { name: "gemini-images", version: "0.2.0" },
-  { capabilities: { tools: {}, logging: {} } },
+  { capabilities: { tools: {}, logging: {} } }
 );
 
-// 发送 MCP 日志消息
-function sendLog(level, data) {
-  const message = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-  // 同时也打印到 stderr 以便终端调试
-  console.error(`[${level}] ${message}`);
-  
-  // 尝试通过 MCP 协议发送日志（如果 server 已连接）
-  try {
-    if (server && server.transport) {
-      server.sendLoggingMessage({
-        level: level,
-        data: message,
-      }).catch(() => {}); // 忽略发送失败（可能是连接未就绪）
-    }
-  } catch (e) {
-    // 忽略错误
-  }
-}
-
-function debugLog(...args) {
-  if (isDebugEnabled()) {
-    sendLog("debug", args.join(" "));
-  }
-}
-
-function normalizeBaseUrl(raw) {
-  const trimmed = String(raw ?? "").trim();
-  if (!trimmed) return "http://127.0.0.1:8317";
-  return trimmed.replace(/\/+$/, "");
-}
-
-function toV1BaseUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl);
-  if (normalized.endsWith("/v1")) return normalized;
-  return `${normalized}/v1`;
-}
-
-function parseIntOr(value, fallback) {
-  const n = Number.parseInt(String(value ?? ""), 10);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function clampInt(value, min, max) {
-  const n = Number.isFinite(value) ? value : min;
-  return Math.max(min, Math.min(max, n));
-}
-
-function extFromMime(mimeType) {
-  switch (String(mimeType || "").toLowerCase()) {
-    case "image/jpeg":
-    case "image/jpg":
-      return "jpg";
-    case "image/webp":
-      return "webp";
-    case "image/gif":
-      return "gif";
-    case "image/png":
-    default:
-      return "png";
-  }
-}
-
-async function getDefaultPicturesDir() {
-  const home = os.homedir();
-  
-  // Windows & macOS: 默认 ~/Pictures
-  if (process.platform === "win32" || process.platform === "darwin") {
-    return path.join(home, "Pictures");
-  }
-  
-  // Linux: 尝试读取 XDG 配置
-  try {
-    const configPath = path.join(home, ".config", "user-dirs.dirs");
-    const content = await fs.readFile(configPath, "utf-8");
-    const match = content.match(/^XDG_PICTURES_DIR="?([^"\n]+)"?$/m);
-    if (match) {
-      let dir = match[1];
-      // 处理 $HOME 变量
-      if (dir.startsWith("$HOME/")) {
-        dir = path.join(home, dir.slice(6));
-      } else if (dir === "$HOME") {
-        dir = home;
-      }
-      return dir;
-    }
-  } catch (e) {
-    // 忽略读取错误，回退到默认
-  }
-  
-  return path.join(home, "Pictures");
-}
-
-function resolveOutDir(rawOutDir) {
-  let outDir = String(rawOutDir ?? "").trim();
-  
-  // 不再提供默认路径，返回空让调用方处理
-  if (!outDir) return "";
-  
-  // 处理 ~ 路径 (Home 目录)
-  if (outDir.startsWith("~")) {
-    outDir = path.join(os.homedir(), outDir.slice(1));
-  }
-  
-  if (path.isAbsolute(outDir)) return outDir;
-  // 相对路径基于用户当前工作目录，而非项目安装目录
-  return path.resolve(process.cwd(), outDir);
-}
-
-function toDisplayPath(filePath) {
-  return String(filePath ?? "").replaceAll("\\", "/");
-}
-
-function formatDateForFilename(date) {
-  const d = date instanceof Date ? date : new Date();
-  const pad2 = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
-}
-
-function isDebugEnabled() {
-  return process.env.OPENAI_DEBUG === "1" || process.env.DEBUG === "1";
-}
-
-function parseDataUrl(maybeDataUrl) {
-  const s = String(maybeDataUrl ?? "");
-  const match = /^data:([^;]+);base64,(.+)$/s.exec(s);
-  if (!match) return null;
-  return {
-    mimeType: match[1].trim() || "application/octet-stream",
-    base64: match[2],
-  };
-}
-
-function stripDataUrlPrefix(maybeDataUrl) {
-  const parsed = parseDataUrl(maybeDataUrl);
-  return parsed ? parsed.base64 : String(maybeDataUrl ?? "");
-}
-
-async function fetchWithTimeout(url, init, timeoutMs) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...init, signal: controller.signal });
-    return res;
-  } catch (err) {
-    if (err.name === "AbortError") {
-      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)}秒），请检查网络或增加 OPENAI_TIMEOUT_MS`);
-    }
-    throw new Error(`网络请求失败: ${err.message || err}`);
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function isValidBase64(str) {
-  if (typeof str !== "string" || !str.trim()) return false;
-  try {
-    const decoded = Buffer.from(str, "base64");
-    return decoded.length > 0 && Buffer.from(decoded).toString("base64") === str.replace(/\s/g, "");
-  } catch {
-    return false;
-  }
-}
-
-async function fetchUrlAsBase64(url, timeoutMs) {
-  const res = await fetchWithTimeout(url, { method: "GET" }, timeoutMs);
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`拉取图片失败: HTTP ${res.status} ${body}`);
-  }
-  const mimeTypeHeader = res.headers.get("content-type") ?? "image/png";
-  const mimeType = mimeTypeHeader.split(";")[0].trim() || "image/png";
-  const arrayBuffer = await res.arrayBuffer();
-  const base64 = Buffer.from(arrayBuffer).toString("base64");
-  return { base64, mimeType };
-}
-
-class HttpError extends Error {
-  constructor(message, { status, url, body }) {
-    super(message);
-    this.name = "HttpError";
-    this.status = status;
-    this.url = url;
-    this.body = body;
-  }
-}
-
-async function generateImagesViaImagesApi({
-  baseUrl,
-  apiKey,
-  model,
-  prompt,
-  size,
-  n,
-  timeoutMs,
-}) {
-  const v1BaseUrl = toV1BaseUrl(baseUrl);
-  const url = `${v1BaseUrl}/images/generations`;
-
-  const headers = {
-    "content-type": "application/json",
-  };
-  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-
-  const body = {
-    model,
-    prompt,
-    size,
-    n,
-    response_format: "b64_json",
-  };
-
-  debugLog(
-    `[upstream] POST ${url} (images/generations) model=${model} size=${size} n=${n} hasApiKey=${Boolean(apiKey)}`,
-  );
-
-  const res = await fetchWithTimeout(
-    url,
-    { method: "POST", headers, body: JSON.stringify(body) },
-    timeoutMs,
-  );
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    const hint =
-      res.status === 401 ? "（看起来需要 API Key，请设置 OPENAI_API_KEY）" : "";
-    throw new HttpError(`图片生成失败: HTTP ${res.status}${hint} ${text}`, {
-      status: res.status,
-      url,
-      body: text,
-    });
-  }
-
-  /** @type {{ data?: Array<{ b64_json?: string; url?: string }>} } */
-  const json = await res.json();
-  const data = Array.isArray(json?.data) ? json.data : [];
-
-  /** @type {Array<{base64:string; mimeType:string}>} */
-  const images = [];
-  for (const item of data) {
-    if (typeof item?.b64_json === "string" && item.b64_json.trim()) {
-      const parsed = parseDataUrl(item.b64_json);
-      images.push({
-        base64: stripDataUrlPrefix(item.b64_json),
-        mimeType: parsed?.mimeType ?? "image/png",
-      });
-      continue;
-    }
-    if (typeof item?.url === "string" && item.url.trim()) {
-      images.push(await fetchUrlAsBase64(item.url, timeoutMs));
-    }
-  }
-
-  if (images.length === 0) throw new Error("接口未返回可用的图片数据");
-  return images;
-}
-
-/**
- * 通过 Gemini 原生 API (generateContent) 生成图片
- * 端点: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
- */
-async function generateImagesViaGeminiNative({
-  baseUrl,
-  apiKey,
-  model,
-  prompt,
-  size,
-  timeoutMs,
-  historyMessages = [],
-  inputImage = null,
-}) {
-  // Gemini 原生 API 端点格式
-  // baseUrl 应该是 https://generativelanguage.googleapis.com/v1beta
-  const normalizedBase = normalizeBaseUrl(baseUrl).replace(/\/+$/, "");
-  const url = `${normalizedBase}/models/${model}:generateContent?key=${apiKey}`;
-
-  const headers = {
-    "content-type": "application/json",
-  };
-
-  // 构建 Gemini 原生格式的 contents
-  const contents = [];
-  
-  // 添加历史消息
-  for (const msg of historyMessages) {
-    contents.push({
-      role: msg.role === "assistant" ? "model" : "user",
-      parts: Array.isArray(msg.content) 
-        ? msg.content.map(item => {
-            if (item.type === "text") return { text: item.text };
-            if (item.type === "image_url" && item.image_url?.url) {
-              const parsed = parseDataUrl(item.image_url.url);
-              if (parsed) {
-                return { inline_data: { data: parsed.base64, mime_type: parsed.mimeType } };
-              }
-            }
-            return { text: String(item.text || "") };
-          })
-        : [{ text: String(msg.content) }],
-    });
-  }
-
-  // 构建当前用户消息
-  const currentParts = [{ text: prompt }];
-  if (inputImage && inputImage.base64) {
-    currentParts.push({
-      inline_data: {
-        data: inputImage.base64,
-        mime_type: inputImage.mimeType || "image/png",
-      },
-    });
-  }
-  contents.push({ role: "user", parts: currentParts });
-
-  // 解析尺寸为宽高比
-  let aspectRatio = "1:1";
-  if (size) {
-    const sizeMatch = /^(\d+)x(\d+)$/i.exec(size);
-    if (sizeMatch) {
-      const w = parseInt(sizeMatch[1], 10);
-      const h = parseInt(sizeMatch[2], 10);
-      // 常见宽高比映射
-      const ratio = w / h;
-      if (Math.abs(ratio - 1) < 0.1) aspectRatio = "1:1";
-      else if (Math.abs(ratio - 16/9) < 0.1) aspectRatio = "16:9";
-      else if (Math.abs(ratio - 9/16) < 0.1) aspectRatio = "9:16";
-      else if (Math.abs(ratio - 4/3) < 0.1) aspectRatio = "4:3";
-      else if (Math.abs(ratio - 3/4) < 0.1) aspectRatio = "3:4";
-      else if (Math.abs(ratio - 3/2) < 0.1) aspectRatio = "3:2";
-      else if (Math.abs(ratio - 2/3) < 0.1) aspectRatio = "2:3";
-    }
-  }
-
-  const body = {
-    contents,
-    generationConfig: {
-      responseModalities: ["TEXT", "IMAGE"],
-      imageConfig: {
-        aspectRatio,
-      },
-    },
-  };
-
-  debugLog(
-    `[upstream] POST ${url.replace(/key=[^&]+/, "key=***")} (Gemini native) model=${model} aspectRatio=${aspectRatio} historyLen=${historyMessages.length} hasInputImage=${Boolean(inputImage)}`,
-  );
-
-  const res = await fetchWithTimeout(
-    url,
-    { method: "POST", headers, body: JSON.stringify(body) },
-    timeoutMs,
-  );
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    const hint =
-      res.status === 401 || res.status === 403 ? "（API Key 无效或无权限，请检查 GEMINI_API_KEY）" : "";
-    throw new HttpError(`图片生成失败: HTTP ${res.status}${hint} ${text}`, {
-      status: res.status,
-      url: url.replace(/key=[^&]+/, "key=***"),
-      body: text,
-    });
-  }
-
-  const json = await res.json();
-  
-  /** @type {Array<{base64:string; mimeType:string}>} */
-  const images = [];
-
-  // 解析 Gemini 原生响应: candidates[].content.parts[].inline_data
-  const candidates = Array.isArray(json?.candidates) ? json.candidates : [];
-  for (const candidate of candidates) {
-    const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
-    for (const part of parts) {
-      if (part?.inlineData?.data) {
-        // Gemini API 使用 camelCase
-        images.push({
-          base64: part.inlineData.data,
-          mimeType: part.inlineData.mimeType || "image/png",
-        });
-      } else if (part?.inline_data?.data) {
-        // 也支持 snake_case（某些版本可能使用）
-        images.push({
-          base64: part.inline_data.data,
-          mimeType: part.inline_data.mime_type || "image/png",
-        });
-      }
-    }
-  }
-
-  if (images.length === 0) {
-    const debugInfo = isDebugEnabled() ? `\n响应结构: ${JSON.stringify(json, null, 2).slice(0, 500)}` : "";
-    throw new Error(
-      `Gemini 原生 API 未返回图片数据。请确保使用支持图片生成的模型（如 gemini-2.5-flash-image 或 gemini-3-pro-image-preview）${debugInfo}`,
-    );
-  }
-
-  return images;
-}
-
-async function generateImagesViaChatCompletions({
-  baseUrl,
-  apiKey,
-  model,
-  prompt,
-  size,
-  timeoutMs,
-  historyMessages = [],  // 多轮对话历史消息
-  inputImage = null,     // 输入图片 {base64, mimeType}
-}) {
-  const v1BaseUrl = toV1BaseUrl(baseUrl);
-  const url = `${v1BaseUrl}/chat/completions`;
-
-  const headers = {
-    "content-type": "application/json",
-  };
-  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-
-  // 构建当前用户消息内容
-  let currentUserContent;
-  if (inputImage && inputImage.base64) {
-    // 多模态消息：文本 + 图片
-    currentUserContent = [
-      { type: "text", text: prompt },
-      {
-        type: "image_url",
-        image_url: {
-          url: `data:${inputImage.mimeType || "image/png"};base64,${inputImage.base64}`,
-        },
-      },
-    ];
-  } else {
-    currentUserContent = prompt;
-  }
-
-  // 合并历史消息和当前消息
-  const messages = [
-    ...historyMessages,
-    { role: "user", content: currentUserContent },
-  ];
-
-  // 构建请求体，兼容多种 API 格式
-  // - Gemini 官方 OpenAI 兼容层使用 extra_body.google.response_modalities
-  // - 第三方代理可能使用 modalities 或其他字段
-  const body = {
-    model,
-    messages,
-    stream: false,
-    // 标准 OpenAI 格式（某些代理支持）
-    modalities: ["text", "image"],
-    // Gemini 官方 OpenAI 兼容层格式
-    extra_body: {
-      google: {
-        response_modalities: ["TEXT", "IMAGE"],
-        image_config: {
-          image_size: size,
-        },
-      },
-    },
-    // 某些代理使用的格式
-    image_config: {
-      image_size: size,
-    },
-  };
-
-  debugLog(
-    `[upstream] POST ${url} (chat/completions) model=${model} image_config.image_size=${size} hasApiKey=${Boolean(apiKey)} historyLen=${historyMessages.length} hasInputImage=${Boolean(inputImage)}`,
-  );
-
-  const res = await fetchWithTimeout(
-    url,
-    { method: "POST", headers, body: JSON.stringify(body) },
-    timeoutMs,
-  );
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    const hint =
-      res.status === 401 ? "（看起来需要 API Key，请设置 OPENAI_API_KEY）" : "";
-    throw new HttpError(`图片生成失败: HTTP ${res.status}${hint} ${text}`, {
-      status: res.status,
-      url,
-      body: text,
-    });
-  }
-
-  /** @type {{ choices?: Array<{ message?: { content?: any, images?: Array<any> } }>, candidates?: Array<{ content?: { parts?: Array<any> } }> }} */
-  const json = await res.json();
-  
-  /** @type {Array<{base64:string; mimeType:string}>} */
-  const images = [];
-
-  // ============ 多格式响应解析 ============
-  // 支持以下格式：
-  // 1. Gemini 原生 API: candidates[].content.parts[].inline_data
-  // 2. Gemini OpenAI 兼容层: choices[].message.content (parts 数组)
-  // 3. 第三方代理格式: choices[].message.images[]
-  // 4. 标准 OpenAI 多模态: choices[].message.content[] (type: "image_url")
-
-  // 格式 1: Gemini 原生 API (generateContent 响应)
-  const candidates = Array.isArray(json?.candidates) ? json.candidates : [];
-  for (const candidate of candidates) {
-    const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
-    for (const part of parts) {
-      // inline_data 格式: { data: base64, mime_type: "image/png" }
-      if (part?.inline_data?.data) {
-        images.push({
-          base64: part.inline_data.data,
-          mimeType: part.inline_data.mime_type || "image/png",
-        });
-      }
-    }
-  }
-
-  // 格式 2-4: OpenAI 兼容格式
-  const choices = Array.isArray(json?.choices) ? json.choices : [];
-  for (const choice of choices) {
-    const message = choice?.message;
-    if (!message) continue;
-
-    // 格式 2: Gemini OpenAI 兼容层 - content 可能是 parts 数组
-    // 格式 4: 标准 OpenAI 多模态 - content 是包含 type 的对象数组
-    const content = message.content;
-    if (Array.isArray(content)) {
-      for (const item of content) {
-        // Gemini 格式: { inline_data: { data, mime_type } }
-        if (item?.inline_data?.data) {
-          images.push({
-            base64: item.inline_data.data,
-            mimeType: item.inline_data.mime_type || "image/png",
-          });
-          continue;
-        }
-        // OpenAI 多模态格式: { type: "image_url", image_url: { url: "data:..." } }
-        if (item?.type === "image_url" && item?.image_url?.url) {
-          const parsed = parseDataUrl(item.image_url.url);
-          if (parsed) {
-            images.push({ base64: parsed.base64, mimeType: parsed.mimeType });
-          } else if (item.image_url.url.startsWith("http")) {
-            images.push(await fetchUrlAsBase64(item.image_url.url, timeoutMs));
-          }
-        }
-      }
-    }
-
-    // 格式 3: 第三方代理格式 (如某些 Nano Banana 代理)
-    const messageImages = message.images;
-    if (Array.isArray(messageImages)) {
-      for (const img of messageImages) {
-        // 尝试多种属性名
-        const imageUrl =
-          img?.image_url?.url ?? img?.url ?? img?.imageUrl ?? img?.image_url ?? "";
-        if (typeof imageUrl !== "string" || !imageUrl.trim()) continue;
-
-        const parsed = parseDataUrl(imageUrl);
-        if (parsed) {
-          images.push({ base64: parsed.base64, mimeType: parsed.mimeType });
-          continue;
-        }
-        if (imageUrl.startsWith("http")) {
-          images.push(await fetchUrlAsBase64(imageUrl, timeoutMs));
-        }
-      }
-    }
-  }
-  // ============ 多格式响应解析结束 ============
-
-  if (images.length === 0) {
-    // 提供更详细的调试信息
-    const debugInfo = isDebugEnabled() ? `\n响应结构: ${JSON.stringify(Object.keys(json || {}))}` : "";
-    throw new Error(
-      `接口未返回可用的图片数据。支持的格式：candidates[].content.parts[].inline_data, choices[].message.content[], choices[].message.images[]${debugInfo}`,
-    );
-  }
-
-  return images;
-}
-
-async function generateImages(params) {
-  const mode = String(process.env.OPENAI_IMAGE_MODE ?? "gemini")
-    .trim()
-    .toLowerCase();
-
-  const count = clampInt(parseIntOr(params?.n, 1), 1, 4);
-
-  // ============ API 模式选择 ============
-  // gemini: Gemini 原生 API (generateContent) - 推荐用于 Gemini 模型
-  // openai: OpenAI 原生 API (images/generations) - 用于 DALL-E 等
-  // chat: OpenAI chat/completions 格式 - 用于兼容层/代理
-  // auto: 自动检测（先尝试 images API，失败则回退到 chat）
-
-  if (mode === "gemini") {
-    // Gemini 原生 API
-    /** @type {Array<{base64:string; mimeType:string}>} */
-    const out = [];
-    for (let i = 0; i < count; i += 1) {
-      const batch = await generateImagesViaGeminiNative(params);
-      out.push(...batch);
-      if (out.length >= count) break;
-    }
-    return out.slice(0, count);
-  }
-
-  if (mode === "openai" || mode === "images") {
-    // OpenAI 原生 images/generations API
-    return await generateImagesViaImagesApi(params);
-  }
-
-  if (mode === "auto") {
-    // 自动检测：先尝试 OpenAI images API，失败则尝试 Gemini 原生，最后回退到 chat
-    try {
-      return await generateImagesViaImagesApi(params);
-    } catch (err) {
-      if (err instanceof HttpError && (err.status === 404 || err.status === 400)) {
-        debugLog("[upstream] images/generations 失败，尝试 Gemini 原生 API");
-        try {
-          const out = [];
-          for (let i = 0; i < count; i += 1) {
-            const batch = await generateImagesViaGeminiNative(params);
-            out.push(...batch);
-            if (out.length >= count) break;
-          }
-          return out.slice(0, count);
-        } catch (geminiErr) {
-          debugLog("[upstream] Gemini 原生 API 失败，回退到 chat/completions");
-          const out = [];
-          for (let i = 0; i < count; i += 1) {
-            const batch = await generateImagesViaChatCompletions(params);
-            out.push(...batch);
-            if (out.length >= count) break;
-          }
-          return out.slice(0, count);
-        }
-      }
-      throw err;
-    }
-  }
-
-  // chat (兼容模式)
-  /** @type {Array<{base64:string; mimeType:string}>} */
-  const out = [];
-  for (let i = 0; i < count; i += 1) {
-    const batch = await generateImagesViaChatCompletions(params);
-    out.push(...batch);
-    if (out.length >= count) break;
-  }
-  return out.slice(0, count);
-}
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "generate_image",
-      description: `生成或编辑 AI 图片（支持 Nano Banana 多轮对话）。
+// 设置服务器实例供日志模块使用
+setMcpServer(server);
+
+// 启动会话清理定时器
+startSessionCleanup();
+
+// ============ 工具定义 ============
+const GENERATE_IMAGE_TOOL = {
+  name: "generate_image",
+  description: `生成或编辑 AI 图片（支持 Nano Banana 多轮对话）。
 
 使用场景：
 - 用户说"画一个..."、"生成一张..."、"创建图片..."
@@ -763,44 +72,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 - 返回的 session_id 可用于后续多轮编辑
 
 提示词技巧：prompt 越详细效果越好，建议包含：主体、风格、颜色、构图、光线等`,
-      inputSchema: {
-        type: "object",
-        properties: {
-          prompt: {
-            oneOf: [
-              { type: "string" },
-              { type: "array", items: { type: "string" } },
-            ],
-            description: "图片描述（必填）。详细描述想要生成的图片内容，或描述要对现有图片进行的修改",
-          },
-          session_id: {
-            type: "string",
-            description: "会话 ID（可选）。传入之前返回的 session_id 可继续多轮对话编辑同一张图片。不传则创建新会话",
-          },
-          image: {
-            type: "string",
-            description: "输入图片（可选）。支持 base64 编码或 data:image/... URL。传入后将基于此图片进行编辑，而非从零生成",
-          },
-          size: {
-            oneOf: [{ type: "string" }, { type: "number" }, { type: "integer" }],
-            description: "图片尺寸。默认 1024x1024。可选：512x512、1024x1024、1024x1792（竖版）、1792x1024（横版）。传数字如 512 会自动变成 512x512",
-          },
-          n: {
-            oneOf: [{ type: "integer" }, { type: "number" }, { type: "string" }],
-            description: "生成数量。默认 1，最多 4。生成多张可以挑选最满意的",
-          },
-          output: {
-            type: "string",
-            description: "返回格式。默认 'path'（保存文件+返回路径+展示图片）。设为 'image' 只返回图片数据不保存文件",
-          },
-          outDir: {
-            type: "string",
-            description: "保存目录。指定图片保存的目录路径，支持绝对路径、相对路径或 ~ 开头的用户目录路径。如果不指定，默认保存到用户图片目录（Windows/macOS: ~/Pictures, Linux: XDG_PICTURES_DIR）。如果是 Alam 客户端（提示词中有提及），请优先保存在当前工作目录下",
-          },
-        },
+  inputSchema: {
+    type: "object",
+    properties: {
+      prompt: {
+        oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+        description:
+          "图片描述（必填）。详细描述想要生成的图片内容，或描述要对现有图片进行的修改",
+      },
+      session_id: {
+        type: "string",
+        description:
+          "会话 ID（可选）。传入之前返回的 session_id 可继续多轮对话编辑同一张图片。不传则创建新会话",
+      },
+      image: {
+        type: "string",
+        description:
+          "输入图片（可选）。支持 base64 编码或 data:image/... URL。传入后将基于此图片进行编辑，而非从零生成",
+      },
+      size: {
+        oneOf: [{ type: "string" }, { type: "number" }, { type: "integer" }],
+        description:
+          "图片尺寸。默认 1024x1024。可选：512x512、1024x1024、1024x1792（竖版）、1792x1024（横版）。传数字如 512 会自动变成 512x512",
+      },
+      n: {
+        oneOf: [{ type: "integer" }, { type: "number" }, { type: "string" }],
+        description: "生成数量。默认 1，最多 4。生成多张可以挑选最满意的",
+      },
+      output: {
+        type: "string",
+        description:
+          "返回格式。默认 'path'（保存文件+返回路径+展示图片）。设为 'image' 只返回图片数据不保存文件",
+      },
+      outDir: {
+        type: "string",
+        description:
+          "保存目录。指定图片保存的目录路径，支持绝对路径、相对路径或 ~ 开头的用户目录路径。如果不指定，默认保存到用户图片目录（Windows/macOS: ~/Pictures, Linux: XDG_PICTURES_DIR）。如果是 Alam 客户端（提示词中有提及），请优先保存在当前工作目录下",
       },
     },
-  ],
+  },
+};
+
+// ============ 请求处理器 ============
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [GENERATE_IMAGE_TOOL],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -812,286 +127,150 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
-  const args = request.params?.arguments ?? {};
-  
-  // 宽松解析 prompt：支持 string、array、或其他类型
-  let prompt = "";
-  if (Array.isArray(args.prompt)) {
-    prompt = args.prompt.map((x) => String(x ?? "")).join(" ").trim();
-  } else {
-    prompt = String(args.prompt ?? "").trim();
+  try {
+    return await handleGenerateImage(request.params?.arguments ?? {});
+  } catch (err) {
+    return buildErrorResponse(err);
   }
+});
+
+// ============ 核心业务逻辑 ============
+/**
+ * 处理图片生成请求
+ */
+async function handleGenerateImage(args) {
+  // 解析 prompt
+  const prompt = parsePrompt(args.prompt);
   if (!prompt) {
     return { isError: true, content: [{ type: "text", text: "参数 prompt 不能为空" }] };
   }
 
-  // ============ 多轮对话会话处理 ============
-  // 解析 session_id
+  // 解析会话
   const sessionId = args.session_id ?? args.sessionId ?? args.session ?? null;
   const session = getOrCreateSession(sessionId);
-  const isNewSession = !sessionId || sessionId !== session.id;
-  
-  debugLog(`[session] ${isNewSession ? "创建新会话" : "继续会话"}: ${session.id}, 历史消息数: ${session.messages.length}`);
+  const isNew = isNewSession(sessionId, session);
 
-  // 解析输入图片（用于图片编辑）
-  let inputImage = null;
-  const imageArg = args.image ?? args.input_image ?? args.inputImage ?? null;
-  
-  if (imageArg) {
-    // 用户显式传入了图片
-    const parsed = parseDataUrl(imageArg);
-    if (parsed) {
-      inputImage = { base64: parsed.base64, mimeType: parsed.mimeType };
-    } else if (isValidBase64(imageArg)) {
-      inputImage = { base64: imageArg, mimeType: "image/png" };
-    } else {
-      debugLog(`[session] 无法解析输入图片参数`);
-    }
-  } else if (!isNewSession && session.lastImage) {
-    // 继续会话时，自动使用上一轮生成的图片
-    inputImage = session.lastImage;
-    debugLog(`[session] 使用上一轮生成的图片进行编辑`);
-  }
-  // ============ 多轮对话会话处理结束 ============
-
-  // 宽松解析 size：支持 string、number（如 1024 → "1024x1024"）
-  let size = String(args.size ?? process.env.OPENAI_IMAGE_SIZE ?? DEFAULT_SIZE).trim();
-  if (/^\d+$/.test(size)) {
-    size = `${size}x${size}`;
-  }
-
-  // 宽松解析 n：支持 integer、number、string
-  const n = clampInt(parseIntOr(args.n, 1), 1, 4);
-  
-  // 宽松解析 output：识别多种同义词
-  const outputRaw = String(args.output ?? process.env.OPENAI_IMAGE_RETURN ?? DEFAULT_OUTPUT)
-    .trim()
-    .toLowerCase();
-  const output = ["image", "base64", "b64", "data", "inline"].includes(outputRaw) ? "image" : "path";
-  
-  // 宽松解析 outDir：支持多种参数命名风格
-  let outDir = resolveOutDir(
-    args.outDir ?? args.out_dir ?? args.outdir ?? args.output_dir ?? process.env.OPENAI_IMAGE_OUT_DIR
+  debugLog(
+    `[session] ${isNew ? "创建新会话" : "继续会话"}: ${session.id}, 历史消息数: ${session.messages.length}`
   );
-  
+
+  // 解析输入图片
+  const inputImage = parseInputImage(args, isNew, session);
+
+  // 解析其他参数
+  const size = parseSize(args.size);
+  const n = clampInt(parseIntOr(args.n, 1), 1, 4);
+  const output = parseOutput(args.output);
+  let outDir = resolveOutDir(
+    args.outDir ?? args.out_dir ?? args.outdir ?? args.output_dir ?? config.defaultOutDir
+  );
+
   // 如果未指定 outDir，且 output=path，则使用默认图片目录
   if (output === "path" && !outDir) {
     outDir = await getDefaultPicturesDir();
   }
-  
+
   // output=path 模式下，outDir 是必填的
   if (output === "path" && !outDir) {
-    return { 
-      isError: true, 
-      content: [{ 
-        type: "text", 
-        text: "参数 outDir 不能为空。请指定图片保存目录，例如：\n- Windows: outDir: 'C:/Users/xxx/Pictures' 或 '~/Pictures'\n- macOS/Linux: outDir: '~/Pictures' 或 '/home/xxx/Pictures'\n注：~ 会自动解析为用户主目录" 
-      }] 
-    };
-  }
-
-  const baseUrl = process.env.OPENAI_BASE_URL ?? "http://127.0.0.1:8317";
-  const apiKey = process.env.OPENAI_API_KEY ?? process.env.GEMINI_API_KEY ?? "";
-  
-  // 模型由环境变量控制，不在工具调用时指定
-  const model = process.env.OPENAI_MODEL ?? DEFAULT_MODEL;
-  
-  const timeoutMs = clampInt(
-    parseIntOr(process.env.OPENAI_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
-    5_000,
-    600_000,
-  );
-
-  try {
-    const images = await generateImages({
-      baseUrl,
-      apiKey,
-      model,
-      prompt,
-      size,
-      n,
-      timeoutMs,
-      historyMessages: session.messages,  // 传入会话历史
-      inputImage,                          // 传入输入图片
-    });
-
-    // ============ 更新会话状态 ============
-    // 构建用户消息内容（用于保存到历史）
-    let userContent;
-    if (inputImage) {
-      userContent = [
-        { type: "text", text: prompt },
-        { type: "image_url", image_url: { url: `data:${inputImage.mimeType};base64,${inputImage.base64.slice(0, 100)}...` } },
-      ];
-    } else {
-      userContent = prompt;
-    }
-    
-    // 保存用户消息到历史
-    session.messages.push({ role: "user", content: userContent });
-    
-    // 保存助手响应到历史（包含生成的图片）
-    if (images.length > 0) {
-      const firstImage = images[0];
-      session.lastImage = firstImage;
-      
-      // 构建助手消息（简化存储，只保存第一张图片的引用）
-      session.messages.push({
-        role: "assistant",
-        content: [
-          { type: "text", text: `[已生成 ${images.length} 张图片]` },
-          { type: "image_url", image_url: { url: `data:${firstImage.mimeType};base64,${firstImage.base64.slice(0, 100)}...` } },
-        ],
-      });
-    }
-    
-    session.lastUsedAt = Date.now();
-    debugLog(`[session] 会话 ${session.id} 已更新，当前消息数: ${session.messages.length}`);
-    // ============ 更新会话状态结束 ============
-
-    if (output === "image") {
-      return {
-        content: [
-          { type: "text", text: `🔗 session_id: ${session.id}\n（可用于后续多轮编辑）` },
-          ...images.map((img) => ({
-            type: "image",
-            mimeType: img.mimeType,
-            data: img.base64,
-          })),
-        ],
-      };
-    }
-
-    // 权限检查与回退逻辑
-    let finalOutDir = outDir;
-    let warningMsg = "";
-    
-    try {
-      await fs.mkdir(finalOutDir, { recursive: true });
-      // 尝试写入测试以确保有权限（mkdir 可能成功但无写入权限）
-      await fs.access(finalOutDir, fs.constants.W_OK);
-    } catch (err) {
-      const tmpDir = os.tmpdir();
-      debugLog(`[local] 目录 ${finalOutDir} 无法写入 (${err.message})，回退到临时目录: ${tmpDir}`);
-      warningMsg = `⚠️ 原定目录 "${toDisplayPath(finalOutDir)}" 无法写入，已自动保存到临时目录。\n`;
-      finalOutDir = tmpDir;
-      // 确保临时目录存在
-      await fs.mkdir(finalOutDir, { recursive: true });
-    }
-
-    const batchId = `${formatDateForFilename(new Date())}-${crypto.randomBytes(4).toString("hex")}`;
-    const saved = [];
-    const errors = [];
-    
-    for (let i = 0; i < images.length; i += 1) {
-      const img = images[i];
-      const ext = extFromMime(img.mimeType);
-      const filePath = path.join(finalOutDir, `image-${batchId}-${i + 1}.${ext}`);
-      
-      try {
-        // 验证 base64 有效性
-        if (!img.base64 || typeof img.base64 !== "string") {
-          errors.push(`图片 ${i + 1}: 无效的图片数据`);
-          continue;
-        }
-        const buffer = Buffer.from(img.base64, "base64");
-        if (buffer.length === 0) {
-          errors.push(`图片 ${i + 1}: 图片数据为空`);
-          continue;
-        }
-        await fs.writeFile(filePath, buffer);
-        saved.push(filePath);
-      } catch (writeErr) {
-        errors.push(`图片 ${i + 1}: 保存失败 - ${writeErr.message}`);
-      }
-    }
-
-    debugLog(`[local] 已保存 ${saved.length} 张图片到 ${finalOutDir}`);
-    
-    // 构建结构化返回
-    const resultLines = [];
-    if (warningMsg) {
-      resultLines.push(warningMsg);
-    }
-    if (saved.length > 0) {
-      resultLines.push(`✅ 成功生成 ${saved.length} 张图片：\n`);
-      // 使用 Markdown 图片语法，让支持的客户端可以直接渲染
-      saved.forEach((p) => {
-        const displayPath = toDisplayPath(p);
-        // file:// URI 格式，兼容大多数 Markdown 渲染器
-        const fileUri = `file:///${displayPath.replace(/^\//, '')}`;
-        resultLines.push(`![${path.basename(p)}](${fileUri})`);
-        resultLines.push(`📁 ${displayPath}\n`);
-      });
-    }
-    if (errors.length > 0) {
-      resultLines.push(`⚠️ 部分失败：`);
-      errors.forEach((e) => resultLines.push(e));
-    }
-    
-    // 添加 session_id 信息，用于多轮对话
-    resultLines.push(`\n🔗 session_id: \`${session.id}\``);
-    resultLines.push(`💡 提示：后续调用时传入此 session_id 可继续编辑这张图片`);
-
-    // 构建返回内容
-    const content = [
-      {
-        type: "text",
-        text: resultLines.join("\n"),
-      },
-    ];
-    
-    // 智能判断是否附带图片数据（作为备选，某些客户端可能不支持 file:// URI）：
-    // - 小图片（< 阈值）：附带图片数据，确保能展示
-    // - 大图片（≥ 阈值）：只用 Markdown 路径，避免 token 爆炸
-    // 可通过环境变量 OPENAI_IMAGE_INLINE_MAX_SIZE 调整阈值（单位：字节，默认 512KB）
-    // 设为 0 可完全禁用 base64 内联，只使用 Markdown 路径
-    const inlineMaxSize = parseIntOr(process.env.OPENAI_IMAGE_INLINE_MAX_SIZE, 512 * 1024);
-    
-    if (inlineMaxSize > 0) {
-      for (const img of images) {
-        if (img.base64 && typeof img.base64 === "string") {
-          const estimatedSize = img.base64.length * 0.75;
-          if (estimatedSize <= inlineMaxSize) {
-            content.push({
-              type: "image",
-              mimeType: img.mimeType || "image/png",
-              data: img.base64,
-            });
-          }
-        }
-      }
-    }
-
-    return { content };
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    // 提供更友好的错误信息和建议
-    let suggestion = "";
-    if (errMsg.includes("ECONNREFUSED") || errMsg.includes("ENOTFOUND")) {
-      suggestion = "\n💡 建议：检查 OPENAI_BASE_URL 是否正确，服务是否已启动";
-    } else if (errMsg.includes("401") || errMsg.includes("API Key")) {
-      suggestion = "\n💡 建议：设置 OPENAI_API_KEY 或 GEMINI_API_KEY 环境变量";
-    } else if (errMsg.includes("超时")) {
-      suggestion = "\n💡 建议：增加 OPENAI_TIMEOUT_MS 环境变量（当前默认 120 秒）";
-    } else if (errMsg.includes("ENOSPC")) {
-      suggestion = "\n💡 建议：磁盘空间不足，请清理后重试";
-    } else if (errMsg.includes("EACCES") || errMsg.includes("EPERM")) {
-      suggestion = "\n💡 建议：没有写入权限，请检查 outDir 目录权限";
-    }
-    
     return {
       isError: true,
       content: [
         {
           type: "text",
-          text: `❌ 生成失败: ${errMsg}${suggestion}`,
+          text: "参数 outDir 不能为空。请指定图片保存目录，例如：\n- Windows: outDir: 'C:/Users/xxx/Pictures' 或 '~/Pictures'\n- macOS/Linux: outDir: '~/Pictures' 或 '/home/xxx/Pictures'\n注：~ 会自动解析为用户主目录",
         },
       ],
     };
   }
-});
 
+  // 调用 API 生成图片
+  const images = await generateImages({
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    model: config.model,
+    prompt,
+    size,
+    n,
+    timeoutMs: config.timeoutMs,
+    historyMessages: session.messages,
+    inputImage,
+  });
+
+  // 更新会话状态
+  const userContent = buildUserContent(prompt, inputImage);
+  updateSession(session, userContent, images);
+
+  // 构建返回结果
+  if (output === "image") {
+    return { content: buildImageOnlyContent(images, session.id) };
+  }
+
+  // 保存图片并返回
+  const saveResult = await saveImages(images, outDir);
+  const text = formatSaveResultText(saveResult, session.id);
+  const content = buildMcpContent(images, text);
+
+  return { content };
+}
+
+// ============ 参数解析辅助函数 ============
+/**
+ * 解析 prompt 参数
+ */
+function parsePrompt(raw) {
+  if (Array.isArray(raw)) {
+    return raw.map((x) => String(x ?? "")).join(" ").trim();
+  }
+  return String(raw ?? "").trim();
+}
+
+/**
+ * 解析 size 参数
+ */
+function parseSize(raw) {
+  let size = String(raw ?? config.defaultSize).trim();
+  if (/^\d+$/.test(size)) {
+    size = `${size}x${size}`;
+  }
+  return size;
+}
+
+/**
+ * 解析 output 参数
+ */
+function parseOutput(raw) {
+  const outputRaw = String(raw ?? config.defaultOutput).trim().toLowerCase();
+  return ["image", "base64", "b64", "data", "inline"].includes(outputRaw) ? "image" : "path";
+}
+
+/**
+ * 解析输入图片参数
+ */
+function parseInputImage(args, isNew, session) {
+  const imageArg = args.image ?? args.input_image ?? args.inputImage ?? null;
+
+  if (imageArg) {
+    const parsed = parseDataUrl(imageArg);
+    if (parsed) {
+      return { base64: parsed.base64, mimeType: parsed.mimeType };
+    }
+    if (isValidBase64(imageArg)) {
+      return { base64: imageArg, mimeType: "image/png" };
+    }
+    debugLog(`[session] 无法解析输入图片参数`);
+    return null;
+  }
+
+  // 继续会话时，自动使用上一轮生成的图片
+  if (!isNew && session.lastImage) {
+    debugLog(`[session] 使用上一轮生成的图片进行编辑`);
+    return session.lastImage;
+  }
+
+  return null;
+}
+
+// ============ 服务器启动 ============
 const transport = new StdioServerTransport();
 
 // 全局异常处理
