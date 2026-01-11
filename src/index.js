@@ -22,7 +22,7 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_OUTPUT = "path"; // path|image
 
 const server = new Server(
-  { name: "gemini-image-mcp", version: "0.1.0" },
+  { name: "gemini-images", version: "0.1.0" },
   { capabilities: { tools: {}, logging: {} } },
 );
 
@@ -672,13 +672,13 @@ const transport = new StdioServerTransport();
 
 // 全局异常处理
 process.on("uncaughtException", (err) => {
-  console.error(`[gemini-image-mcp] 未捕获异常: ${err.message}`);
+  console.error(`[gemini-images] 未捕获异常: ${err.message}`);
   debugLog(err.stack);
 });
 
 process.on("unhandledRejection", (reason) => {
-  console.error(`[gemini-image-mcp] 未处理的 Promise 拒绝: ${reason}`);
+  console.error(`[gemini-images] 未处理的 Promise 拒绝: ${reason}`);
 });
 
 await server.connect(transport);
-console.error("gemini-image-mcp 已启动（stdio）");
+console.error("gemini-images 已启动（stdio）");
