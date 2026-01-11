@@ -1,7 +1,7 @@
 {
   "name": "@laomeifun/gemini-images",
-  "version": "0.1.0",
-  "description": "MCP server: generate images via an OpenAI-compatible Gemini endpoint",
+  "version": "0.2.0",
+  "description": "MCP server: generate and edit images via Gemini with Nano Banana multi-turn conversation support",
   "type": "module",
   "main": "src/index.js",
   "bin": {
@@ -17,6 +17,9 @@
     "model-context-protocol",
     "gemini",
     "image-generation",
+    "image-editing",
+    "nano-banana",
+    "multi-turn",
     "ai",
     "openai-compatible"
   ],

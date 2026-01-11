@@ -20,9 +20,70 @@ const DEFAULT_MODEL = "gemini-3-pro-image-preview";
 const DEFAULT_SIZE = "1024x1024";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_OUTPUT = "path"; // path|image
+const DEFAULT_SESSION_TTL_MS = 30 * 60 * 1000; // 会话默认 30 分钟过期
+
+// ============ 多轮对话会话管理 ============
+/**
+ * 会话存储结构
+ * @type {Map<string, {
+ *   id: string,
+ *   messages: Array<{role: string, content: any}>,
+ *   lastImage: {base64: string, mimeType: string} | null,
+ *   createdAt: number,
+ *   lastUsedAt: number
+ * }>}
+ */
+const sessions = new Map();
+
+/**
+ * 生成会话 ID
+ */
+function generateSessionId() {
+  return crypto.randomBytes(8).toString("hex");
+}
+
+/**
+ * 获取或创建会话
+ */
+function getOrCreateSession(sessionId) {
+  if (sessionId && sessions.has(sessionId)) {
+    const session = sessions.get(sessionId);
+    session.lastUsedAt = Date.now();
+    return session;
+  }
+  
+  const newSession = {
+    id: generateSessionId(),
+    messages: [],
+    lastImage: null,
+    createdAt: Date.now(),
+    lastUsedAt: Date.now(),
+  };
+  sessions.set(newSession.id, newSession);
+  return newSession;
+}
+
+/**
+ * 清理过期会话
+ */
+function cleanupExpiredSessions() {
+  const ttl = parseIntOr(process.env.SESSION_TTL_MS, DEFAULT_SESSION_TTL_MS);
+  const now = Date.now();
+  for (const [id, session] of sessions) {
+    if (now - session.lastUsedAt > ttl) {
+      sessions.delete(id);
+      debugLog(`[session] 清理过期会话: ${id}`);
+    }
+  }
+}
+
+// 每 5 分钟清理一次过期会话
+setInterval(cleanupExpiredSessions, 5 * 60 * 1000);
+
+// ============ 多轮对话会话管理结束 ============
 
 const server = new Server(
-  { name: "gemini-images", version: "0.1.0" },
+  { name: "gemini-images", version: "0.2.0" },
   { capabilities: { tools: {}, logging: {} } },
 );
 
@@ -288,6 +349,8 @@ async function generateImagesViaChatCompletions({
   prompt,
   size,
   timeoutMs,
+  historyMessages = [],  // 多轮对话历史消息
+  inputImage = null,     // 输入图片 {base64, mimeType}
 }) {
   const v1BaseUrl = toV1BaseUrl(baseUrl);
   const url = `${v1BaseUrl}/chat/completions`;
@@ -297,9 +360,32 @@ async function generateImagesViaChatCompletions({
   };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
 
+  // 构建当前用户消息内容
+  let currentUserContent;
+  if (inputImage && inputImage.base64) {
+    // 多模态消息：文本 + 图片
+    currentUserContent = [
+      { type: "text", text: prompt },
+      {
+        type: "image_url",
+        image_url: {
+          url: `data:${inputImage.mimeType || "image/png"};base64,${inputImage.base64}`,
+        },
+      },
+    ];
+  } else {
+    currentUserContent = prompt;
+  }
+
+  // 合并历史消息和当前消息
+  const messages = [
+    ...historyMessages,
+    { role: "user", content: currentUserContent },
+  ];
+
   const body = {
     model,
-    messages: [{ role: "user", content: prompt }],
+    messages,
     stream: false,
     modalities: ["image"],
     image_config: {
@@ -308,7 +394,7 @@ async function generateImagesViaChatCompletions({
   };
 
   debugLog(
-    `[upstream] POST ${url} (chat/completions) model=${model} image_config.image_size=${size} hasApiKey=${Boolean(apiKey)}`,
+    `[upstream] POST ${url} (chat/completions) model=${model} image_config.image_size=${size} hasApiKey=${Boolean(apiKey)} historyLen=${historyMessages.length} hasInputImage=${Boolean(inputImage)}`,
   );
 
   const res = await fetchWithTimeout(
@@ -406,17 +492,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "generate_image",
-      description: `生成 AI 图片。当用户需要创建、绘制、生成图片/图像/插图/照片时使用此工具。
+      description: `生成或编辑 AI 图片（支持 Nano Banana 多轮对话）。
 
 使用场景：
 - 用户说"画一个..."、"生成一张..."、"创建图片..."
 - 需要可视化某个概念或想法
 - 制作插图、图标、艺术作品
+- 编辑现有图片（修改背景、添加元素、调整风格等）
+
+多轮对话编辑：
+- 首次生成图片后会返回 session_id
+- 后续调用时传入相同的 session_id 可继续编辑同一张图片
+- 例如：先生成一张猫的图片，然后说"把背景改成蓝色"
+- 也可以传入 image 参数直接编辑指定图片
 
 返回说明：
 - 默认会保存图片到本地并返回文件路径，同时返回图片数据供直接展示
 - 设置 output="image" 则只返回图片数据不保存文件
-- 如果是 Alam 客户端，你可以直接使用返回的文件路径通过 Markdown 语法渲染图片，例如 ![image](file:///path/to/image.png)
+- 返回的 session_id 可用于后续多轮编辑
 
 提示词技巧：prompt 越详细效果越好，建议包含：主体、风格、颜色、构图、光线等`,
       inputSchema: {
@@ -427,7 +520,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               { type: "string" },
               { type: "array", items: { type: "string" } },
             ],
-            description: "图片描述（必填）。详细描述想要生成的图片内容，如：'一只橙色的猫咪坐在窗台上，阳光透过窗户照进来，水彩画风格'",
+            description: "图片描述（必填）。详细描述想要生成的图片内容，或描述要对现有图片进行的修改",
+          },
+          session_id: {
+            type: "string",
+            description: "会话 ID（可选）。传入之前返回的 session_id 可继续多轮对话编辑同一张图片。不传则创建新会话",
+          },
+          image: {
+            type: "string",
+            description: "输入图片（可选）。支持 base64 编码或 data:image/... URL。传入后将基于此图片进行编辑，而非从零生成",
           },
           size: {
             oneOf: [{ type: "string" }, { type: "number" }, { type: "integer" }],
@@ -472,6 +573,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (!prompt) {
     return { isError: true, content: [{ type: "text", text: "参数 prompt 不能为空" }] };
   }
+
+  // ============ 多轮对话会话处理 ============
+  // 解析 session_id
+  const sessionId = args.session_id ?? args.sessionId ?? args.session ?? null;
+  const session = getOrCreateSession(sessionId);
+  const isNewSession = !sessionId || sessionId !== session.id;
+  
+  debugLog(`[session] ${isNewSession ? "创建新会话" : "继续会话"}: ${session.id}, 历史消息数: ${session.messages.length}`);
+
+  // 解析输入图片（用于图片编辑）
+  let inputImage = null;
+  const imageArg = args.image ?? args.input_image ?? args.inputImage ?? null;
+  
+  if (imageArg) {
+    // 用户显式传入了图片
+    const parsed = parseDataUrl(imageArg);
+    if (parsed) {
+      inputImage = { base64: parsed.base64, mimeType: parsed.mimeType };
+    } else if (isValidBase64(imageArg)) {
+      inputImage = { base64: imageArg, mimeType: "image/png" };
+    } else {
+      debugLog(`[session] 无法解析输入图片参数`);
+    }
+  } else if (!isNewSession && session.lastImage) {
+    // 继续会话时，自动使用上一轮生成的图片
+    inputImage = session.lastImage;
+    debugLog(`[session] 使用上一轮生成的图片进行编辑`);
+  }
+  // ============ 多轮对话会话处理结束 ============
 
   // 宽松解析 size：支持 string、number（如 1024 → "1024x1024"）
   let size = String(args.size ?? process.env.OPENAI_IMAGE_SIZE ?? DEFAULT_SIZE).trim();
@@ -530,15 +660,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       size,
       n,
       timeoutMs,
+      historyMessages: session.messages,  // 传入会话历史
+      inputImage,                          // 传入输入图片
     });
+
+    // ============ 更新会话状态 ============
+    // 构建用户消息内容（用于保存到历史）
+    let userContent;
+    if (inputImage) {
+      userContent = [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: `data:${inputImage.mimeType};base64,${inputImage.base64.slice(0, 100)}...` } },
+      ];
+    } else {
+      userContent = prompt;
+    }
+    
+    // 保存用户消息到历史
+    session.messages.push({ role: "user", content: userContent });
+    
+    // 保存助手响应到历史（包含生成的图片）
+    if (images.length > 0) {
+      const firstImage = images[0];
+      session.lastImage = firstImage;
+      
+      // 构建助手消息（简化存储，只保存第一张图片的引用）
+      session.messages.push({
+        role: "assistant",
+        content: [
+          { type: "text", text: `[已生成 ${images.length} 张图片]` },
+          { type: "image_url", image_url: { url: `data:${firstImage.mimeType};base64,${firstImage.base64.slice(0, 100)}...` } },
+        ],
+      });
+    }
+    
+    session.lastUsedAt = Date.now();
+    debugLog(`[session] 会话 ${session.id} 已更新，当前消息数: ${session.messages.length}`);
+    // ============ 更新会话状态结束 ============
 
     if (output === "image") {
       return {
-        content: images.map((img) => ({
-          type: "image",
-          mimeType: img.mimeType,
-          data: img.base64,
-        })),
+        content: [
+          { type: "text", text: `🔗 session_id: ${session.id}\n（可用于后续多轮编辑）` },
+          ...images.map((img) => ({
+            type: "image",
+            mimeType: img.mimeType,
+            data: img.base64,
+          })),
+        ],
       };
     }
 
@@ -608,6 +777,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       resultLines.push(`⚠️ 部分失败：`);
       errors.forEach((e) => resultLines.push(e));
     }
+    
+    // 添加 session_id 信息，用于多轮对话
+    resultLines.push(`\n🔗 session_id: \`${session.id}\``);
+    resultLines.push(`💡 提示：后续调用时传入此 session_id 可继续编辑这张图片`);
 
     // 构建返回内容
     const content = [
