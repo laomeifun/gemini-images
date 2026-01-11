@@ -40,7 +40,7 @@ import {
 
 // ============ MCP 服务器初始化 ============
 const server = new Server(
-  { name: "gemini-images", version: "0.3.1" },
+  { name: "gemini-images", version: "0.3.2" },
   { capabilities: { tools: {}, logging: {} } }
 );
 

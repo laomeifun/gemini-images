@@ -1,6 +1,6 @@
 {
   "name": "@laomeifun/gemini-images",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "MCP server: generate and edit images via Gemini with Nano Banana multi-turn conversation support",
   "type": "module",
   "main": "src/index.js",
