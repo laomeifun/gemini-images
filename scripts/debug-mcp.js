@@ -1,10 +1,19 @@
 #!/usr/bin/env node
-import "dotenv/config";
+import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.resolve(__dirname, "..");
+
+// 加载环境变量：优先 .env.local，然后 .env
+dotenv.config({ path: path.join(PROJECT_ROOT, ".env.local") });
+dotenv.config({ path: path.join(PROJECT_ROOT, ".env") });
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -55,6 +64,28 @@ function parseArgs(argv) {
       out.output = a.slice("--output=".length);
       continue;
     }
+    if (a === "--session" || a === "--session_id") {
+      out.session_id = argv[i + 1];
+      i += 1;
+      continue;
+    }
+    if (a.startsWith("--session=")) {
+      out.session_id = a.slice("--session=".length);
+      continue;
+    }
+    if (a.startsWith("--session_id=")) {
+      out.session_id = a.slice("--session_id=".length);
+      continue;
+    }
+    if (a === "--image" || a === "-i") {
+      out.image = argv[i + 1];
+      i += 1;
+      continue;
+    }
+    if (a.startsWith("--image=")) {
+      out.image = a.slice("--image=".length);
+      continue;
+    }
     out._.push(a);
   }
   return out;
@@ -88,6 +119,26 @@ const size = String(args.size ?? process.env.OPENAI_IMAGE_SIZE ?? "1024x1024").t
 const n = Number.parseInt(String(args.n ?? "1"), 10);
 const outDir = path.resolve(process.cwd(), String(args.out ?? "debug-output"));
 const output = String(args.output ?? "").trim();
+const sessionId = args.session_id ?? null;
+const imagePath = args.image ?? null;
+
+// 如果提供了图片路径，读取并转换为 base64
+let imageBase64 = null;
+if (imagePath) {
+  try {
+    const imageBuffer = await fs.readFile(imagePath);
+    imageBase64 = imageBuffer.toString("base64");
+    // 根据扩展名确定 MIME 类型
+    const ext = path.extname(imagePath).toLowerCase();
+    const mimeMap = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" };
+    const mimeType = mimeMap[ext] || "image/png";
+    imageBase64 = `data:${mimeType};base64,${imageBase64}`;
+    console.log(`已加载图片: ${imagePath}`);
+  } catch (err) {
+    console.error(`无法读取图片文件: ${imagePath} - ${err.message}`);
+    process.exit(2);
+  }
+}
 
 const client = new Client({ name: "debug-client", version: "0.1.0" });
 const transport = new StdioClientTransport({
@@ -101,9 +152,14 @@ const transport = new StdioClientTransport({
 try {
   await client.connect(transport);
 
+  const toolArgs = { prompt, n, size };
+  if (output) toolArgs.output = output;
+  if (sessionId) toolArgs.session_id = sessionId;
+  if (imageBase64) toolArgs.image = imageBase64;
+
   const result = await client.callTool({
     name: "generate_image",
-    arguments: { prompt, n, size, ...(output ? { output } : {}) },
+    arguments: toolArgs,
   });
 
   if (result.isError) {

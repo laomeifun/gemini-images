@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import "dotenv/config";
+import dotenv from "dotenv";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -15,6 +15,10 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROJECT_ROOT = path.resolve(__dirname, "..");
+
+// 加载环境变量：优先 .env.local，然后 .env
+dotenv.config({ path: path.join(PROJECT_ROOT, ".env.local") });
+dotenv.config({ path: path.join(PROJECT_ROOT, ".env") });
 
 const DEFAULT_MODEL = "gemini-3-pro-image-preview";
 const DEFAULT_SIZE = "1024x1024";
@@ -191,7 +195,8 @@ function resolveOutDir(rawOutDir) {
   }
   
   if (path.isAbsolute(outDir)) return outDir;
-  return path.resolve(PROJECT_ROOT, outDir);
+  // 相对路径基于用户当前工作目录，而非项目安装目录
+  return path.resolve(process.cwd(), outDir);
 }
 
 function toDisplayPath(filePath) {
@@ -342,6 +347,149 @@ async function generateImagesViaImagesApi({
   return images;
 }
 
+/**
+ * 通过 Gemini 原生 API (generateContent) 生成图片
+ * 端点: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+ */
+async function generateImagesViaGeminiNative({
+  baseUrl,
+  apiKey,
+  model,
+  prompt,
+  size,
+  timeoutMs,
+  historyMessages = [],
+  inputImage = null,
+}) {
+  // Gemini 原生 API 端点格式
+  // baseUrl 应该是 https://generativelanguage.googleapis.com/v1beta
+  const normalizedBase = normalizeBaseUrl(baseUrl).replace(/\/+$/, "");
+  const url = `${normalizedBase}/models/${model}:generateContent?key=${apiKey}`;
+
+  const headers = {
+    "content-type": "application/json",
+  };
+
+  // 构建 Gemini 原生格式的 contents
+  const contents = [];
+  
+  // 添加历史消息
+  for (const msg of historyMessages) {
+    contents.push({
+      role: msg.role === "assistant" ? "model" : "user",
+      parts: Array.isArray(msg.content) 
+        ? msg.content.map(item => {
+            if (item.type === "text") return { text: item.text };
+            if (item.type === "image_url" && item.image_url?.url) {
+              const parsed = parseDataUrl(item.image_url.url);
+              if (parsed) {
+                return { inline_data: { data: parsed.base64, mime_type: parsed.mimeType } };
+              }
+            }
+            return { text: String(item.text || "") };
+          })
+        : [{ text: String(msg.content) }],
+    });
+  }
+
+  // 构建当前用户消息
+  const currentParts = [{ text: prompt }];
+  if (inputImage && inputImage.base64) {
+    currentParts.push({
+      inline_data: {
+        data: inputImage.base64,
+        mime_type: inputImage.mimeType || "image/png",
+      },
+    });
+  }
+  contents.push({ role: "user", parts: currentParts });
+
+  // 解析尺寸为宽高比
+  let aspectRatio = "1:1";
+  if (size) {
+    const sizeMatch = /^(\d+)x(\d+)$/i.exec(size);
+    if (sizeMatch) {
+      const w = parseInt(sizeMatch[1], 10);
+      const h = parseInt(sizeMatch[2], 10);
+      // 常见宽高比映射
+      const ratio = w / h;
+      if (Math.abs(ratio - 1) < 0.1) aspectRatio = "1:1";
+      else if (Math.abs(ratio - 16/9) < 0.1) aspectRatio = "16:9";
+      else if (Math.abs(ratio - 9/16) < 0.1) aspectRatio = "9:16";
+      else if (Math.abs(ratio - 4/3) < 0.1) aspectRatio = "4:3";
+      else if (Math.abs(ratio - 3/4) < 0.1) aspectRatio = "3:4";
+      else if (Math.abs(ratio - 3/2) < 0.1) aspectRatio = "3:2";
+      else if (Math.abs(ratio - 2/3) < 0.1) aspectRatio = "2:3";
+    }
+  }
+
+  const body = {
+    contents,
+    generationConfig: {
+      responseModalities: ["TEXT", "IMAGE"],
+      imageConfig: {
+        aspectRatio,
+      },
+    },
+  };
+
+  debugLog(
+    `[upstream] POST ${url.replace(/key=[^&]+/, "key=***")} (Gemini native) model=${model} aspectRatio=${aspectRatio} historyLen=${historyMessages.length} hasInputImage=${Boolean(inputImage)}`,
+  );
+
+  const res = await fetchWithTimeout(
+    url,
+    { method: "POST", headers, body: JSON.stringify(body) },
+    timeoutMs,
+  );
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    const hint =
+      res.status === 401 || res.status === 403 ? "（API Key 无效或无权限，请检查 GEMINI_API_KEY）" : "";
+    throw new HttpError(`图片生成失败: HTTP ${res.status}${hint} ${text}`, {
+      status: res.status,
+      url: url.replace(/key=[^&]+/, "key=***"),
+      body: text,
+    });
+  }
+
+  const json = await res.json();
+  
+  /** @type {Array<{base64:string; mimeType:string}>} */
+  const images = [];
+
+  // 解析 Gemini 原生响应: candidates[].content.parts[].inline_data
+  const candidates = Array.isArray(json?.candidates) ? json.candidates : [];
+  for (const candidate of candidates) {
+    const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+    for (const part of parts) {
+      if (part?.inlineData?.data) {
+        // Gemini API 使用 camelCase
+        images.push({
+          base64: part.inlineData.data,
+          mimeType: part.inlineData.mimeType || "image/png",
+        });
+      } else if (part?.inline_data?.data) {
+        // 也支持 snake_case（某些版本可能使用）
+        images.push({
+          base64: part.inline_data.data,
+          mimeType: part.inline_data.mime_type || "image/png",
+        });
+      }
+    }
+  }
+
+  if (images.length === 0) {
+    const debugInfo = isDebugEnabled() ? `\n响应结构: ${JSON.stringify(json, null, 2).slice(0, 500)}` : "";
+    throw new Error(
+      `Gemini 原生 API 未返回图片数据。请确保使用支持图片生成的模型（如 gemini-2.5-flash-image 或 gemini-3-pro-image-preview）${debugInfo}`,
+    );
+  }
+
+  return images;
+}
+
 async function generateImagesViaChatCompletions({
   baseUrl,
   apiKey,
@@ -383,11 +531,25 @@ async function generateImagesViaChatCompletions({
     { role: "user", content: currentUserContent },
   ];
 
+  // 构建请求体，兼容多种 API 格式
+  // - Gemini 官方 OpenAI 兼容层使用 extra_body.google.response_modalities
+  // - 第三方代理可能使用 modalities 或其他字段
   const body = {
     model,
     messages,
     stream: false,
-    modalities: ["image"],
+    // 标准 OpenAI 格式（某些代理支持）
+    modalities: ["text", "image"],
+    // Gemini 官方 OpenAI 兼容层格式
+    extra_body: {
+      google: {
+        response_modalities: ["TEXT", "IMAGE"],
+        image_config: {
+          image_size: size,
+        },
+      },
+    },
+    // 某些代理使用的格式
     image_config: {
       image_size: size,
     },
@@ -414,33 +576,92 @@ async function generateImagesViaChatCompletions({
     });
   }
 
-  /** @type {{ choices?: Array<{ message?: { images?: Array<any> } }> }} */
+  /** @type {{ choices?: Array<{ message?: { content?: any, images?: Array<any> } }>, candidates?: Array<{ content?: { parts?: Array<any> } }> }} */
   const json = await res.json();
-  const choices = Array.isArray(json?.choices) ? json.choices : [];
-
+  
   /** @type {Array<{base64:string; mimeType:string}>} */
   const images = [];
 
-  for (const choice of choices) {
-    const messageImages = choice?.message?.images;
-    if (!Array.isArray(messageImages)) continue;
-    for (const img of messageImages) {
-      const imageUrl =
-        img?.image_url?.url ?? img?.url ?? img?.imageUrl ?? img?.image_url ?? "";
-      if (typeof imageUrl !== "string" || !imageUrl.trim()) continue;
+  // ============ 多格式响应解析 ============
+  // 支持以下格式：
+  // 1. Gemini 原生 API: candidates[].content.parts[].inline_data
+  // 2. Gemini OpenAI 兼容层: choices[].message.content (parts 数组)
+  // 3. 第三方代理格式: choices[].message.images[]
+  // 4. 标准 OpenAI 多模态: choices[].message.content[] (type: "image_url")
 
-      const parsed = parseDataUrl(imageUrl);
-      if (parsed) {
-        images.push({ base64: parsed.base64, mimeType: parsed.mimeType });
-        continue;
+  // 格式 1: Gemini 原生 API (generateContent 响应)
+  const candidates = Array.isArray(json?.candidates) ? json.candidates : [];
+  for (const candidate of candidates) {
+    const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+    for (const part of parts) {
+      // inline_data 格式: { data: base64, mime_type: "image/png" }
+      if (part?.inline_data?.data) {
+        images.push({
+          base64: part.inline_data.data,
+          mimeType: part.inline_data.mime_type || "image/png",
+        });
       }
-      images.push(await fetchUrlAsBase64(imageUrl, timeoutMs));
     }
   }
 
+  // 格式 2-4: OpenAI 兼容格式
+  const choices = Array.isArray(json?.choices) ? json.choices : [];
+  for (const choice of choices) {
+    const message = choice?.message;
+    if (!message) continue;
+
+    // 格式 2: Gemini OpenAI 兼容层 - content 可能是 parts 数组
+    // 格式 4: 标准 OpenAI 多模态 - content 是包含 type 的对象数组
+    const content = message.content;
+    if (Array.isArray(content)) {
+      for (const item of content) {
+        // Gemini 格式: { inline_data: { data, mime_type } }
+        if (item?.inline_data?.data) {
+          images.push({
+            base64: item.inline_data.data,
+            mimeType: item.inline_data.mime_type || "image/png",
+          });
+          continue;
+        }
+        // OpenAI 多模态格式: { type: "image_url", image_url: { url: "data:..." } }
+        if (item?.type === "image_url" && item?.image_url?.url) {
+          const parsed = parseDataUrl(item.image_url.url);
+          if (parsed) {
+            images.push({ base64: parsed.base64, mimeType: parsed.mimeType });
+          } else if (item.image_url.url.startsWith("http")) {
+            images.push(await fetchUrlAsBase64(item.image_url.url, timeoutMs));
+          }
+        }
+      }
+    }
+
+    // 格式 3: 第三方代理格式 (如某些 Nano Banana 代理)
+    const messageImages = message.images;
+    if (Array.isArray(messageImages)) {
+      for (const img of messageImages) {
+        // 尝试多种属性名
+        const imageUrl =
+          img?.image_url?.url ?? img?.url ?? img?.imageUrl ?? img?.image_url ?? "";
+        if (typeof imageUrl !== "string" || !imageUrl.trim()) continue;
+
+        const parsed = parseDataUrl(imageUrl);
+        if (parsed) {
+          images.push({ base64: parsed.base64, mimeType: parsed.mimeType });
+          continue;
+        }
+        if (imageUrl.startsWith("http")) {
+          images.push(await fetchUrlAsBase64(imageUrl, timeoutMs));
+        }
+      }
+    }
+  }
+  // ============ 多格式响应解析结束 ============
+
   if (images.length === 0) {
+    // 提供更详细的调试信息
+    const debugInfo = isDebugEnabled() ? `\n响应结构: ${JSON.stringify(Object.keys(json || {}))}` : "";
     throw new Error(
-      "接口未返回可用的图片数据（chat/completions 未找到 choices[].message.images）",
+      `接口未返回可用的图片数据。支持的格式：candidates[].content.parts[].inline_data, choices[].message.content[], choices[].message.images[]${debugInfo}`,
     );
   }
 
@@ -448,36 +669,66 @@ async function generateImagesViaChatCompletions({
 }
 
 async function generateImages(params) {
-  const mode = String(process.env.OPENAI_IMAGE_MODE ?? "chat")
+  const mode = String(process.env.OPENAI_IMAGE_MODE ?? "gemini")
     .trim()
     .toLowerCase();
 
-  if (mode === "images") {
+  const count = clampInt(parseIntOr(params?.n, 1), 1, 4);
+
+  // ============ API 模式选择 ============
+  // gemini: Gemini 原生 API (generateContent) - 推荐用于 Gemini 模型
+  // openai: OpenAI 原生 API (images/generations) - 用于 DALL-E 等
+  // chat: OpenAI chat/completions 格式 - 用于兼容层/代理
+  // auto: 自动检测（先尝试 images API，失败则回退到 chat）
+
+  if (mode === "gemini") {
+    // Gemini 原生 API
+    /** @type {Array<{base64:string; mimeType:string}>} */
+    const out = [];
+    for (let i = 0; i < count; i += 1) {
+      const batch = await generateImagesViaGeminiNative(params);
+      out.push(...batch);
+      if (out.length >= count) break;
+    }
+    return out.slice(0, count);
+  }
+
+  if (mode === "openai" || mode === "images") {
+    // OpenAI 原生 images/generations API
     return await generateImagesViaImagesApi(params);
   }
 
-  const count = clampInt(parseIntOr(params?.n, 1), 1, 4);
-
   if (mode === "auto") {
+    // 自动检测：先尝试 OpenAI images API，失败则尝试 Gemini 原生，最后回退到 chat
     try {
       return await generateImagesViaImagesApi(params);
     } catch (err) {
-      if (err instanceof HttpError && err.status === 404) {
-        debugLog("[upstream] images/generations 返回 404，改用 chat/completions");
-        /** @type {Array<{base64:string; mimeType:string}>} */
-        const out = [];
-        for (let i = 0; i < count; i += 1) {
-          const batch = await generateImagesViaChatCompletions(params);
-          out.push(...batch);
-          if (out.length >= count) break;
+      if (err instanceof HttpError && (err.status === 404 || err.status === 400)) {
+        debugLog("[upstream] images/generations 失败，尝试 Gemini 原生 API");
+        try {
+          const out = [];
+          for (let i = 0; i < count; i += 1) {
+            const batch = await generateImagesViaGeminiNative(params);
+            out.push(...batch);
+            if (out.length >= count) break;
+          }
+          return out.slice(0, count);
+        } catch (geminiErr) {
+          debugLog("[upstream] Gemini 原生 API 失败，回退到 chat/completions");
+          const out = [];
+          for (let i = 0; i < count; i += 1) {
+            const batch = await generateImagesViaChatCompletions(params);
+            out.push(...batch);
+            if (out.length >= count) break;
+          }
+          return out.slice(0, count);
         }
-        return out.slice(0, count);
       }
       throw err;
     }
   }
 
-  // chat (default)
+  // chat (兼容模式)
   /** @type {Array<{base64:string; mimeType:string}>} */
   const out = [];
   for (let i = 0; i < count; i += 1) {

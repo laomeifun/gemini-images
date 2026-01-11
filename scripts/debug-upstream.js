@@ -1,8 +1,17 @@
 #!/usr/bin/env node
-import "dotenv/config";
+import dotenv from "dotenv";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.resolve(__dirname, "..");
+
+// 加载环境变量：优先 .env.local，然后 .env
+dotenv.config({ path: path.join(PROJECT_ROOT, ".env.local") });
+dotenv.config({ path: path.join(PROJECT_ROOT, ".env") });
 
 function normalizeBaseUrl(raw) {
   const trimmed = String(raw ?? "").trim();
@@ -132,7 +141,13 @@ const v1 = toV1BaseUrl(baseUrl);
     model,
     messages: [{ role: "user", content: prompt }],
     stream: false,
-    modalities: ["image"],
+    modalities: ["text", "image"],
+    extra_body: {
+      google: {
+        response_modalities: ["TEXT", "IMAGE"],
+        image_config: { image_size: size },
+      },
+    },
     image_config: { image_size: size },
   };
 
@@ -157,21 +172,55 @@ const v1 = toV1BaseUrl(baseUrl);
   }
 
   const json = JSON.parse(text);
-  const choices = Array.isArray(json?.choices) ? json.choices : [];
+  
   /** @type {Array<{base64:string; mimeType:string}>} */
   const images = [];
+  
+  // 格式 1: Gemini 原生 API (candidates[].content.parts[].inline_data)
+  const candidates = Array.isArray(json?.candidates) ? json.candidates : [];
+  for (const candidate of candidates) {
+    const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+    for (const part of parts) {
+      if (part?.inline_data?.data) {
+        images.push({
+          base64: part.inline_data.data,
+          mimeType: part.inline_data.mime_type || "image/png",
+        });
+      }
+    }
+  }
+
+  // 格式 2: OpenAI 兼容格式 (choices[].message.content[])
+  const choices = Array.isArray(json?.choices) ? json.choices : [];
   for (const choice of choices) {
+    const content = choice?.message?.content;
+    if (Array.isArray(content)) {
+      for (const item of content) {
+        if (item?.inline_data?.data) {
+          images.push({
+            base64: item.inline_data.data,
+            mimeType: item.inline_data.mime_type || "image/png",
+          });
+        }
+        if (item?.type === "image_url" && item?.image_url?.url) {
+          const parsed = parseDataUrl(item.image_url.url);
+          if (parsed) images.push(parsed);
+        }
+      }
+    }
+    // 格式 3: 第三方代理格式 (choices[].message.images[])
     const messageImages = choice?.message?.images;
-    if (!Array.isArray(messageImages)) continue;
-    for (const img of messageImages) {
-      const imageUrl = img?.image_url?.url ?? "";
-      const parsed = parseDataUrl(imageUrl);
-      if (parsed) images.push(parsed);
+    if (Array.isArray(messageImages)) {
+      for (const img of messageImages) {
+        const imageUrl = img?.image_url?.url ?? img?.url ?? "";
+        const parsed = parseDataUrl(imageUrl);
+        if (parsed) images.push(parsed);
+      }
     }
   }
 
   if (images.length === 0) {
-    console.log("没有在 choices[].message.images 里找到图片，响应如下：");
+    console.log("没有找到图片数据，响应如下：");
     console.log(JSON.stringify(json, null, 2));
     process.exit(1);
   }
