@@ -27,6 +27,7 @@ import {
   updateSession,
   buildUserContent,
   startSessionCleanup,
+  listAllSessions,
 } from "./session.js";
 import { generateImages } from "./api-client.js";
 import {
@@ -39,7 +40,7 @@ import {
 
 // ============ MCP 服务器初始化 ============
 const server = new Server(
-  { name: "gemini-images", version: "0.2.0" },
+  { name: "gemini-images", version: "0.3.0" },
   { capabilities: { tools: {}, logging: {} } }
 );
 
@@ -52,24 +53,17 @@ startSessionCleanup();
 // ============ 工具定义 ============
 const GENERATE_IMAGE_TOOL = {
   name: "generate_image",
-  description: `生成或编辑 AI 图片（支持 Nano Banana 多轮对话）。
+  description: `生成或编辑 AI 图片（支持多轮对话编辑）。
+
+【重要】多轮对话编辑：
+- 每次调用都会返回 session_id
+- 如果用户要修改刚生成的图片（如"把背景改成蓝色"、"加个帽子"），必须传入上次返回的 session_id
+- 不传 session_id = 从零开始生成新图片
+- 传入 session_id = 基于之前的图片继续编辑
 
 使用场景：
 - 用户说"画一个..."、"生成一张..."、"创建图片..."
-- 需要可视化某个概念或想法
-- 制作插图、图标、艺术作品
-- 编辑现有图片（修改背景、添加元素、调整风格等）
-
-多轮对话编辑：
-- 首次生成图片后会返回 session_id
-- 后续调用时传入相同的 session_id 可继续编辑同一张图片
-- 例如：先生成一张猫的图片，然后说"把背景改成蓝色"
-- 也可以传入 image 参数直接编辑指定图片
-
-返回说明：
-- 默认会保存图片到本地并返回文件路径，同时返回图片数据供直接展示
-- 设置 output="image" 则只返回图片数据不保存文件
-- 返回的 session_id 可用于后续多轮编辑
+- 用户说"改一下..."、"把...换成..."、"加个..." → 需要传入 session_id
 
 提示词技巧：prompt 越详细效果越好，建议包含：主体、风格、颜色、构图、光线等`,
   inputSchema: {
@@ -83,21 +77,21 @@ const GENERATE_IMAGE_TOOL = {
       session_id: {
         type: "string",
         description:
-          "会话 ID（可选）。传入之前返回的 session_id 可继续多轮对话编辑同一张图片。不传则创建新会话",
+          "会话 ID（关键参数）。如果用户要修改之前生成的图片，必须传入上次调用返回的 session_id。不传则创建新会话生成全新图片",
       },
       image: {
         type: "string",
         description:
-          "输入图片（可选）。支持 base64 编码或 data:image/... URL。传入后将基于此图片进行编辑，而非从零生成",
+          "输入图片（可选）。支持 base64 编码或 data:image/... URL。传入后将基于此图片进行编辑",
       },
       size: {
         oneOf: [{ type: "string" }, { type: "number" }, { type: "integer" }],
         description:
-          "图片尺寸。默认 1024x1024。可选：512x512、1024x1024、1024x1792（竖版）、1792x1024（横版）。传数字如 512 会自动变成 512x512",
+          "图片尺寸。默认 1024x1024。可选：512x512、1024x1024、1024x1792（竖版）、1792x1024（横版）",
       },
       n: {
         oneOf: [{ type: "integer" }, { type: "number" }, { type: "string" }],
-        description: "生成数量。默认 1，最多 4。生成多张可以挑选最满意的",
+        description: "生成数量。默认 1，最多 4",
       },
       output: {
         type: "string",
@@ -107,23 +101,50 @@ const GENERATE_IMAGE_TOOL = {
       outDir: {
         type: "string",
         description:
-          "保存目录。指定图片保存的目录路径，支持绝对路径、相对路径或 ~ 开头的用户目录路径。如果不指定，默认保存到用户图片目录（Windows/macOS: ~/Pictures, Linux: XDG_PICTURES_DIR）。如果是 Alam 客户端（提示词中有提及），请优先保存在当前工作目录下",
+          "保存目录。指定图片保存的目录路径。如果不指定，默认保存到用户图片目录",
       },
     },
   },
 };
 
+const LIST_SESSIONS_TOOL = {
+  name: "list_sessions",
+  description: `列出所有可用的图片编辑会话。
+
+用于查看之前的图片生成/编辑会话，可以通过返回的 session_id 继续之前的多轮对话。
+
+返回信息包括：
+- session_id: 会话 ID，可用于 generate_image 的 session_id 参数
+- messageCount: 对话历史消息数量
+- hasImage: 是否有已生成的图片
+- lastUsedAt: 最后使用时间`,
+  inputSchema: {
+    type: "object",
+    properties: {},
+  },
+};
+
 // ============ 请求处理器 ============
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [GENERATE_IMAGE_TOOL],
+  tools: [GENERATE_IMAGE_TOOL, LIST_SESSIONS_TOOL],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const toolName = request.params?.name;
-  if (toolName !== "generate_image") {
+  // 支持多种工具名变体，提高健壮性
+  // 有些客户端可能添加前缀如 "mcp__gemini-image__" 或 "gemini-image__"
+  const normalizedName = toolName?.replace(/^(mcp__)?gemini[-_]image[s]?__/i, "") ?? "";
+
+  debugLog(`[tool] 收到调用: ${toolName} -> 规范化为: ${normalizedName}`);
+
+  if (normalizedName === "list_sessions") {
+    return handleListSessions();
+  }
+
+  if (normalizedName !== "generate_image") {
     return {
       isError: true,
-      content: [{ type: "text", text: `未知工具: ${toolName}` }],
+      content: [{ type: "text", text: `未知工具: ${toolName}（已尝试规范化为: ${normalizedName}）` }],
     };
   }
 
@@ -135,6 +156,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // ============ 核心业务逻辑 ============
+/**
+ * 处理列出会话请求
+ */
+function handleListSessions() {
+  const sessions = listAllSessions();
+
+  if (sessions.length === 0) {
+    return {
+      content: [{ type: "text", text: "当前没有可用的会话。使用 generate_image 生成图片后会自动创建会话。" }],
+    };
+  }
+
+  // 按最后使用时间排序（最近的在前）
+  sessions.sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+
+  const lines = ["可用的图片编辑会话：\n"];
+  for (const s of sessions) {
+    const age = formatAge(Date.now() - s.lastUsedAt);
+    const imageIcon = s.hasImage ? "🖼️" : "📝";
+    lines.push(`${imageIcon} ${s.id}`);
+    lines.push(`   消息数: ${s.messageCount}, 最后使用: ${age}前`);
+  }
+  lines.push("\n使用 session_id 参数继续编辑: generate_image(prompt=\"...\", session_id=\"xxx\")");
+
+  return {
+    content: [{ type: "text", text: lines.join("\n") }],
+  };
+}
+
+/**
+ * 格式化时间差
+ */
+function formatAge(ms) {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}小时`;
+  const days = Math.floor(hours / 24);
+  return `${days}天`;
+}
+
 /**
  * 处理图片生成请求
  */

@@ -118,8 +118,10 @@ export function formatSaveResultText(saveResult, sessionId) {
     lines.push(...errors);
   }
 
-  lines.push(`\n🔗 session_id: \`${sessionId}\``);
-  lines.push(`💡 提示：后续调用时传入此 session_id 可继续编辑这张图片`);
+  lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  lines.push(`🔗 session_id: ${sessionId}`);
+  lines.push(`📌 如需修改此图片，下次调用时传入此 session_id`);
+  lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
 
   return lines.join("\n");
 }
@@ -166,8 +168,15 @@ export function buildMcpContent(images, text, includeInlineImages = true) {
  * @returns {Array}
  */
 export function buildImageOnlyContent(images, sessionId) {
+  const text = [
+    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+    `🔗 session_id: ${sessionId}`,
+    `📌 如需修改此图片，下次调用时传入此 session_id`,
+    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+  ].join("\n");
+
   return [
-    { type: "text", text: `🔗 session_id: ${sessionId}\n（可用于后续多轮编辑）` },
+    { type: "text", text },
     ...images.map((img) => ({
       type: "image",
       mimeType: img.mimeType,
