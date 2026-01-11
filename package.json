@@ -1,11 +1,11 @@
 {
-  "name": "@laomeifun/gemini-image-mcp",
-  "version": "0.0.1",
+  "name": "@laomeifun/gemini-images",
+  "version": "0.1.0",
   "description": "MCP server: generate images via an OpenAI-compatible Gemini endpoint",
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "gemini-image-mcp": "src/index.js"
+    "gemini-images": "src/index.js"
   },
   "scripts": {
     "start": "node src/index.js",
@@ -24,7 +24,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/laomeifun/geminiimagemcp_public.git"
+    "url": "https://github.com/laomeifun/gemini-images.git"
   },
   "engines": {
     "node": ">=18"

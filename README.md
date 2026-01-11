@@ -1,6 +1,6 @@
-# @laomeifun/gemini-image-mcp
+# @laomeifun/gemini-images
 
-[![npm version](https://img.shields.io/npm/v/@laomeifun/gemini-image-mcp.svg)](https://www.npmjs.com/package/@laomeifun/gemini-image-mcp)
+[![npm version](https://img.shields.io/npm/v/@laomeifun/gemini-images.svg)](https://www.npmjs.com/package/@laomeifun/gemini-images)
 
 一个基于 **MCP (Model Context Protocol)** 的图片生成工具，通过 OpenAI-compatible 接口调用 Gemini 图片模型生成图片。支持 Claude Desktop、VS Code Copilot 等 MCP 客户端。
 
@@ -24,7 +24,7 @@
   "mcpServers": {
     "gemini-image": {
       "command": "npx",
-      "args": ["-y", "@laomeifun/gemini-image-mcp"],
+      "args": ["-y", "@laomeifun/gemini-images"],
       "env": {
         "OPENAI_BASE_URL": "http://127.0.0.1:8317",
         "OPENAI_API_KEY": "<YOUR_API_KEY>",
@@ -38,7 +38,7 @@
 ### 方式二：全局安装
 
 ```bash
-npm install -g @laomeifun/gemini-image-mcp
+npm install -g @laomeifun/gemini-images
 ```
 
 然后在 MCP 配置中使用：
@@ -47,7 +47,7 @@ npm install -g @laomeifun/gemini-image-mcp
 {
   "mcpServers": {
     "gemini-image": {
-      "command": "gemini-image-mcp",
+      "command": "gemini-images",
       "env": {
         "OPENAI_BASE_URL": "http://127.0.0.1:8317",
         "OPENAI_API_KEY": "<YOUR_API_KEY>"
@@ -60,8 +60,8 @@ npm install -g @laomeifun/gemini-image-mcp
 ### 方式三：从源码运行
 
 ```bash
-git clone https://github.com/laomeifun/geminiimagemcp_public.git
-cd geminiimagemcp_public
+git clone https://github.com/laomeifun/gemini-images.git
+cd gemini-images
 npm install
 ```
 
@@ -72,7 +72,7 @@ MCP 配置：
   "mcpServers": {
     "gemini-image": {
       "command": "node",
-      "args": ["<PATH_TO>/geminiimagemcp_public/src/index.js"],
+      "args": ["<PATH_TO>/gemini-images/src/index.js"],
       "env": {
         "OPENAI_BASE_URL": "http://127.0.0.1:8317",
         "OPENAI_API_KEY": "<YOUR_API_KEY>"
@@ -92,6 +92,7 @@ MCP 配置：
 | `OPENAI_IMAGE_SIZE` | 否 | `1024x1024` | 默认图片尺寸 |
 | `OPENAI_IMAGE_MODE` | 否 | `chat` | API 模式：`chat`、`images`、`auto` |
 | `OPENAI_IMAGE_OUT_DIR` | 否 | - | 默认保存目录（如果工具调用时未指定） |
+| `OPENAI_IMAGE_RETURN` | 否 | `path` | 默认返回格式：`path`（保存文件）或 `image`（只返回 base64） |
 | `OPENAI_IMAGE_INLINE_MAX_SIZE` | 否 | `524288` (512KB) | 内联展示的最大图片大小（字节），超过则只返回路径 |
 | `OPENAI_TIMEOUT_MS` | 否 | `120000` | 请求超时时间（毫秒） |
 | `OPENAI_DEBUG` | 否 | - | 设为 `1` 开启调试日志 |
@@ -105,12 +106,12 @@ MCP 配置：
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `prompt` | string / string[] | ✅ | 图片描述，越详细效果越好 |
-| `outDir` | string | ✅* | 保存目录。支持绝对路径、相对路径、`~` 开头的用户目录 |
+| `outDir` | string | 否 | 保存目录。支持绝对路径、相对路径、`~` 开头的用户目录。未指定时默认保存到用户图片目录（Windows/macOS: `~/Pictures`，Linux: `XDG_PICTURES_DIR`） |
 | `size` | string / number | 否 | 图片尺寸，默认 `1024x1024`。可选：`512x512`、`1024x1792`（竖版）、`1792x1024`（横版） |
 | `n` | number | 否 | 生成数量，默认 1，最多 4 |
 | `output` | string | 否 | 返回格式：`path`（默认，保存文件）或 `image`（只返回数据不保存） |
 
-> *注：当 `output=path` 时，`outDir` 为必填参数
+> 注：当 `output=image` 时，图片不会保存到本地，仅返回 base64 数据。
 
 ### 使用示例
 
