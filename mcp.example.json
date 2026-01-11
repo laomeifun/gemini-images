@@ -2,7 +2,7 @@
   "mcpServers": {
     "gemini-image": {
       "command": "node",
-      "args": ["<ABSOLUTE_PATH_TO>/geminiimagemcp/src/index.js"],
+      "args": ["<ABSOLUTE_PATH_TO>/gemini-images/src/index.js"],
       "env": {
         "OPENAI_BASE_URL": "http://127.0.0.1:8317",
         "OPENAI_API_KEY": "",
