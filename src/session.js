@@ -69,7 +69,7 @@ export function updateSession(session, userContent, images) {
     const firstImage = images[0];
     session.lastImage = firstImage;
 
-    // 构建助手消息（简化存储，只保存第一张图片的引用）
+    // 构建助手消息（保存完整 base64，确保历史回放可用）
     session.messages.push({
       role: "assistant",
       content: [
@@ -77,7 +77,7 @@ export function updateSession(session, userContent, images) {
         {
           type: "image_url",
           image_url: {
-            url: `data:${firstImage.mimeType};base64,${firstImage.base64.slice(0, 100)}...`,
+            url: `data:${firstImage.mimeType};base64,${firstImage.base64}`,
           },
         },
       ],
@@ -98,7 +98,7 @@ export function buildUserContent(prompt, inputImage) {
       {
         type: "image_url",
         image_url: {
-          url: `data:${inputImage.mimeType};base64,${inputImage.base64.slice(0, 100)}...`,
+          url: `data:${inputImage.mimeType};base64,${inputImage.base64}`,
         },
       },
     ];
